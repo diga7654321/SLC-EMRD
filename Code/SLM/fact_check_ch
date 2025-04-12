@@ -1,0 +1,184 @@
+import wikipedia
+import json
+import time
+import os
+import re
+import jieba
+from sentence_transformers import SentenceTransformer, util
+from sklearn.feature_extraction.text import TfidfVectorizer
+import itertools
+
+# 🔧 代理设置（如有需要）
+os.environ["http_proxy"] = "http://127.0.0.1:7897"
+os.environ["https_proxy"] = "http://127.0.0.1:7897"
+
+# 🔧 设置 Wikipedia 为中文
+wikipedia.set_lang("zh")
+
+# 🔧 加载适用于中文的语义匹配模型
+semantic_model = SentenceTransformer("shibing624/text2vec-base-chinese")
+
+# 📂 输入和输出路径
+LLM_DATA_FILE = "../../../../../../Inference/Weibo/No_rebuttal/weibo.json"
+FACT_CHECK_RESULTS = "rebuttal_weibo.json"
+
+
+def load_llm_data(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"❌ 文件未找到: {file_path}")
+        return {}
+
+
+def load_existing_results(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def extract_query_terms(text, top_n=3):
+    words = list(jieba.cut(text))
+    words = [w for w in words if len(w.strip()) > 1]
+
+    if not words:
+        return []
+
+    vectorizer = TfidfVectorizer(max_features=top_n)
+    X = vectorizer.fit_transform([" ".join(words)])
+    tfidf_scores = dict(zip(vectorizer.get_feature_names_out(), X.toarray().flatten()))
+    top_keywords = sorted(tfidf_scores, key=tfidf_scores.get, reverse=True)[:top_n]
+
+    return top_keywords
+
+
+def extract_reasons(llm_text):
+    rationale_match = re.search(r"Rationale:\s*(.*?)(?=\nMultimodal Consistency Score:|$)", llm_text, re.DOTALL)
+    rationale = rationale_match.group(1).strip() if rationale_match else "No rationale found"
+
+    multimodal_rationale_match = re.search(r"Multimodal Consistency Rationale:\s*(.*?)(?=\n|$)", llm_text, re.DOTALL)
+    multimodal_rationale = multimodal_rationale_match.group(1).strip() if multimodal_rationale_match else "No multimodal rationale found"
+
+    return rationale, multimodal_rationale
+
+
+def search_wikipedia(query_terms):
+    search_results = []
+    for i in range(len(query_terms), 0, -1):
+        for subset in itertools.combinations(query_terms, i):
+            query = " ".join(subset)
+            print(f"🔍 正在搜索 Wikipedia：{query}")
+
+            try:
+                search_results = wikipedia.search(query)
+                if search_results:
+                    break
+            except wikipedia.exceptions.DisambiguationError as e:
+                print(f"⚠️ `{query}` 有歧义，尝试首个候选项: {e.options[:3]}")
+                search_results = e.options[:3]
+                break
+            except wikipedia.exceptions.PageError:
+                continue
+
+        if search_results:
+            break
+
+    if not search_results:
+        return None
+
+    for title in search_results:
+        try:
+            return wikipedia.summary(title, sentences=5, auto_suggest=False)
+        except wikipedia.exceptions.DisambiguationError as e:
+            try:
+                return wikipedia.summary(e.options[0], sentences=5, auto_suggest=False)
+            except:
+                continue
+        except wikipedia.exceptions.PageError:
+            continue
+    return None
+
+
+def compute_semantic_similarity(text1, text2):
+    emb1 = semantic_model.encode(text1, convert_to_tensor=True)
+    emb2 = semantic_model.encode(text2, convert_to_tensor=True)
+    score = util.pytorch_cos_sim(emb1, emb2).item()
+    return score
+
+
+def fact_check(llm_rationale, wiki_text):
+    if not wiki_text:
+        return "", "No Evidence Found"
+
+    sim = compute_semantic_similarity(llm_rationale, wiki_text)
+    if sim >= 0.5:
+        return sim, "True"
+    elif sim >= 0.25:
+        return sim, "Partial"
+    else:
+        return sim, "False"
+
+
+def save_fact_check_results(results):
+    with open(FACT_CHECK_RESULTS, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+
+
+def run_fact_check():
+    llm_data = load_llm_data(LLM_DATA_FILE)
+    fact_check_results = load_existing_results(FACT_CHECK_RESULTS)
+
+    total = len(llm_data)
+    done = len(fact_check_results)
+    print(f"📊 共 {total} 条数据，已处理 {done} 条，剩余 {total - done} 条\n")
+
+    for idx, (item_id, llm_text) in enumerate(llm_data.items(), start=1):
+        if item_id in fact_check_results:
+            continue
+
+        rationale, multimodal_rationale = extract_reasons(llm_text)
+
+        # 普通理由处理
+        query_rationale = extract_query_terms(rationale)
+        wiki_rationale = search_wikipedia(query_rationale)
+        score_rationale, label_rationale = fact_check(rationale, wiki_rationale)
+
+        # 多模态处理
+        if multimodal_rationale == "No multimodal rationale found" or not multimodal_rationale.strip():
+            print(f"⚠️ 无模态理由: {item_id}")
+            query_mm = []
+            wiki_mm = ""
+            score_mm = ""
+            label_mm = "No Evidence Found"
+        else:
+            query_mm = extract_query_terms(multimodal_rationale)
+            wiki_mm = search_wikipedia(query_mm)
+            score_mm, label_mm = fact_check(multimodal_rationale, wiki_mm)
+
+        # 存储结果
+        fact_check_results[item_id] = {
+            "LLM Rationale": rationale,
+            "Multimodal Consistency Rationale": multimodal_rationale,
+            "Query Terms (Rationale)": query_rationale,
+            "Query Terms (Multimodal Rationale)": query_mm,
+            "Wikipedia Score (Rationale)": score_rationale,
+            "Wikipedia Label (Rationale)": label_rationale,
+            "Wikipedia Evidence (Rationale)": wiki_rationale if wiki_rationale else "No Evidence",
+            "Wikipedia Score (Multimodal Rationale)": score_mm,
+            "Wikipedia Label (Multimodal Rationale)": label_mm,
+            "Wikipedia Evidence (Multimodal Rationale)": wiki_mm if wiki_mm else "No Evidence"
+        }
+
+        save_fact_check_results(fact_check_results)
+
+        print(f"✅ 完成 {item_id}: 普通={score_rationale}→{label_rationale}，模态={score_mm}→{label_mm}")
+        time.sleep(5)
+
+    print(f"\n🎉 全部处理完成，结果保存在：{FACT_CHECK_RESULTS}")
+
+
+if __name__ == "__main__":
+    run_fact_check()
