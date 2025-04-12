@@ -1,0 +1,250 @@
+import wikipedia
+import json
+import time
+import os
+import re
+import spacy
+from sentence_transformers import SentenceTransformer, util
+from sklearn.feature_extraction.text import TfidfVectorizer
+import itertools
+import requests
+
+# 🔧 **代理设置（如果需要）**
+os.environ["http_proxy"] = "http://127.0.0.1:7897"
+os.environ["https_proxy"] = "http://127.0.0.1:7897"
+
+# 🔧 **设置 Wikipedia 语言**
+wikipedia.set_lang("en")
+
+# 🔧 **加载 spaCy 语言模型**
+nlp = spacy.load("en_core_web_sm")
+
+# 🔧 **加载 BERT 语义相似度模型**
+semantic_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# 📂 **输入和输出文件路径**
+LLM_DATA_FILE = "../../../../../../Inference/Pheme/No_rebuttal/pheme.json"
+FACT_CHECK_RESULTS = "rebuttal_pheme.json"
+
+
+# 📌 **读取 LLM 生成的数据**
+def load_llm_data(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"❌ 文件未找到: {file_path}")
+        return {}
+
+
+# 📌 **读取已处理的结果（用于断点续传）**
+def load_existing_results(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+# 📌 **提取多个查询关键词**
+def extract_query_terms(text, top_n=3):
+    """
+    1. 使用 spaCy 提取 **实体**（如人名、组织、地名）。
+    2. 如果没有找到合适实体，则用 **TF-IDF** 提取最重要的 **前 top_n 个关键词**。
+    """
+    doc = nlp(text)
+
+    # 1️⃣ 尝试提取实体
+    entities = [ent.text for ent in doc.ents if ent.label_ in ["PERSON", "ORG", "GPE"]]
+
+    if len(entities) >= top_n:
+        return entities[:top_n]  # 直接返回前 top_n 个实体
+
+    # 2️⃣ 如果实体不足，使用 TF-IDF 提取关键单词
+    words = [token.text.lower() for token in doc if token.is_alpha and not token.is_stop]
+    if len(words) < top_n:  # 词数不足，返回所有单词
+        return words
+
+    vectorizer = TfidfVectorizer(max_features=top_n, stop_words='english')
+    X = vectorizer.fit_transform([" ".join(words)])  # 计算 TF-IDF
+    tfidf_scores = dict(zip(vectorizer.get_feature_names_out(), X.toarray().flatten()))
+
+    # 选择 TF-IDF 最高的单词
+    top_keywords = sorted(tfidf_scores, key=tfidf_scores.get, reverse=True)[:top_n]
+
+    return list(set(entities + top_keywords))  # 实体 + TF-IDF 关键词
+
+
+# 📌 **提取普通理由和模态一致性理由**
+def extract_reasons(llm_text):
+    """
+    从 LLM 文本中提取普通理由和模态一致性理由
+    """
+    # 提取普通理由
+    rationale_match = re.search(r"Rationale:\s*(.*?)(?=\nMultimodal Consistency Score:|$)", llm_text, re.DOTALL)
+    rationale = rationale_match.group(1).strip() if rationale_match else "No rationale found"
+
+    # 提取模态一致性理由
+    multimodal_rationale_match = re.search(r"Multimodal Consistency Rationale:\s*(.*?)(?=\n|$)", llm_text, re.DOTALL)
+    multimodal_rationale = multimodal_rationale_match.group(
+        1).strip() if multimodal_rationale_match else "No multimodal rationale found"
+
+    return rationale, multimodal_rationale
+
+
+# 📌 **Wikipedia 查询**
+def search_wikipedia(query_terms):
+    """
+    1️⃣ 先用 `wikipedia.search()` 获取最佳页面
+    2️⃣ 处理 `DisambiguationError`（歧义错误），自动选择最相关的页面
+    3️⃣ 如果 `wikipedia.summary()` 失败，则用 Wikipedia API 兜底
+    """
+    search_results = []
+
+    # 1️⃣ **先尝试不同组合的搜索**
+    for i in range(len(query_terms), 0, -1):
+        for subset in itertools.combinations(query_terms, i):
+            query = " ".join(subset)
+            print(f"🔍 尝试 Wikipedia 查询: {query}")
+
+            try:
+                search_results = wikipedia.search(query)
+                if search_results:
+                    break  # 找到匹配项就停止
+            except wikipedia.exceptions.DisambiguationError as e:
+                print(f"⚠️ 关键词 `{query}` 具有多个解释，自动选择第一个可能页面: {e.options[:3]}")
+                search_results = e.options[:3]  # 选择前 3 个可能页面
+                break
+            except wikipedia.exceptions.PageError:
+                continue
+
+        if search_results:
+            break
+
+    # 2️⃣ **如果没有结果，使用 Wikipedia API 兜底**
+    if not search_results:
+        api_url = f"https://en.wikipedia.org/w/api.php?action=query&format=json&list=search&srsearch={query}"
+        try:
+            response = requests.get(api_url, timeout=5).json()
+            search_results = [item["title"] for item in response["query"]["search"]][:3]
+        except Exception as e:
+            print(f"❌ Wikipedia API 查询失败: {e}")
+            return None
+
+    # 3️⃣ **尝试获取 Wikipedia 页面摘要**
+    for page_title in search_results:
+        try:
+            print(f"📌 选择 Wikipedia 页面: {page_title}")
+            return wikipedia.summary(page_title, sentences=5, auto_suggest=False)
+        except wikipedia.exceptions.DisambiguationError as e:
+            print(f"⚠️ `{page_title}` 仍然存在歧义，尝试 `{e.options[0]}`")
+            try:
+                return wikipedia.summary(e.options[0], sentences=5, auto_suggest=False)
+            except wikipedia.exceptions.PageError:
+                continue
+        except wikipedia.exceptions.PageError:
+            print(f"❌ 页面 `{page_title}` 不存在，跳过。")
+            continue
+    return None
+
+
+# 📌 **BERT 语义相似度计算**
+def compute_semantic_similarity(text1, text2):
+    """
+    计算两个文本的语义相似度（范围 0-1）。
+    """
+    embeddings1 = semantic_model.encode(text1, convert_to_tensor=True)
+    embeddings2 = semantic_model.encode(text2, convert_to_tensor=True)
+    similarity_score = util.pytorch_cos_sim(embeddings1, embeddings2).item()
+    return similarity_score
+
+
+# 📌 **事实核查评分**
+def fact_check(llm_rationale, wikipedia_text):
+    """
+    计算 LLM 解释与 Wikipedia 语义相似度，并给出匹配分数。
+    """
+    if not wikipedia_text:
+        return 0, "No Evidence Found"
+
+    similarity_score = compute_semantic_similarity(llm_rationale, wikipedia_text)
+
+    if similarity_score >= 0.5:
+        label = "True"
+    elif 0.25 <= similarity_score < 0.5:
+        label = "Partial"
+    else:
+        label = "False"
+
+    return similarity_score, label
+
+
+# 📌 **保存核查结果**
+def save_fact_check_results(results):
+    with open(FACT_CHECK_RESULTS, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+
+
+# 📌 **运行事实核查**
+def run_fact_check():
+    llm_data = load_llm_data(LLM_DATA_FILE)
+    fact_check_results = load_existing_results(FACT_CHECK_RESULTS)
+
+    total_items = len(llm_data)
+    processed_count = len(fact_check_results)
+
+    print(f"🔍 总共有 {total_items} 条数据，已处理 {processed_count} 条，剩余 {total_items - processed_count} 条。\n")
+
+    for idx, (item_id, llm_text) in enumerate(llm_data.items(), start=1):
+        if item_id in fact_check_results:
+            continue
+
+        # 🔍 提取普通理由和模态一致性理由
+        rationale, multimodal_rationale = extract_reasons(llm_text)
+
+        # ---- 处理普通理由 ----
+        query_terms_rationale = extract_query_terms(rationale, top_n=3)
+        wikipedia_info_rationale = search_wikipedia(query_terms_rationale)
+        match_score_rationale, label_rationale = fact_check(rationale, wikipedia_info_rationale)
+
+        # ---- 处理模态一致性理由（如有）----
+        if multimodal_rationale == "No multimodal rationale found" or not multimodal_rationale.strip():
+            print(f"⚠️ 未找到模态一致性理由，跳过: item_id={item_id}")
+            query_terms_multimodal_rationale = []
+            wikipedia_info_multimodal_rationale = ""
+            match_score_multimodal_rationale = ""
+            label_multimodal_rationale = "No Evidence Found"
+        else:
+            query_terms_multimodal_rationale = extract_query_terms(multimodal_rationale, top_n=3)
+            wikipedia_info_multimodal_rationale = search_wikipedia(query_terms_multimodal_rationale)
+            match_score_multimodal_rationale, label_multimodal_rationale = fact_check(
+                multimodal_rationale, wikipedia_info_multimodal_rationale
+            )
+
+        # ✅ 保存处理结果
+        fact_check_results[item_id] = {
+            "LLM Rationale": rationale,
+            "Multimodal Consistency Rationale": multimodal_rationale,
+            "Query Terms (Rationale)": query_terms_rationale,
+            "Query Terms (Multimodal Rationale)": query_terms_multimodal_rationale,
+            "Wikipedia Score (Rationale)": match_score_rationale,
+            "Wikipedia Label (Rationale)": label_rationale,
+            "Wikipedia Evidence (Rationale)": wikipedia_info_rationale if wikipedia_info_rationale else "No Evidence",
+            "Wikipedia Score (Multimodal Rationale)": match_score_multimodal_rationale,
+            "Wikipedia Label (Multimodal Rationale)": label_multimodal_rationale,
+            "Wikipedia Evidence (Multimodal Rationale)": wikipedia_info_multimodal_rationale if wikipedia_info_multimodal_rationale else "No Evidence"
+        }
+
+        save_fact_check_results(fact_check_results)
+
+        print(f"✅ 完成 {item_id}: 普通理由得分 {match_score_rationale} → {label_rationale}")
+        print(f"✅ 完成 {item_id}: 模态理由得分 {match_score_multimodal_rationale} → {label_multimodal_rationale}")
+
+        time.sleep(5)  # 防止请求过快被封
+
+    print(f"\n🎉 所有数据处理完毕，结果已保存至 {FACT_CHECK_RESULTS}")
+
+
+# 🚀 **运行**
+if __name__ == "__main__":
+    run_fact_check()
