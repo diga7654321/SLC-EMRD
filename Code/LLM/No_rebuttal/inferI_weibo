@@ -4,33 +4,26 @@ import time
 import base64
 import os
 from collections import OrderedDict
+import re
 
 # API and Client setup
-OPENAI_KEY = "sk-V9He0b5b0372b2316ba5786853240bc2d8b56c05c28fcEjA"
-OPENAI_BASE = "https://api.gptsapi.net/v1"
+OPENAI_KEY = ""
+OPENAI_BASE = ""
 client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
 
-input_file = '../../../../Datasets/Pheme/pheme_images.json'
-output_file = '../../../../Inference/Pheme/No_rebuttal/pheme.json'
+input_file = '../../../../Datasets/Weibo/weibo.json'
+output_file = '../../../../Inference/Weibo/No_rebuttal/weibo.json'
 
-image_base_path = '../../../../Datasets/Pheme/'  # 图片路径前缀
+image_base_path = '../../../../Datasets/Weibo/'  # 图片路径前缀
 
 # Full prompt with multimodal consistency check (used when there is an image)
 PROMPT_MR2_FULL = (
-    "You are a professional rumor analysis expert. Evaluate the news content’s truthfulness and multimodal consistency, and respond in the following format: "
-    "Score: true: XX, false: XX \nRationale: XX \nMultimodal Consistency Score: XX \nMultimodal Consistency Rationale: XX "
-    "Score: News truthfulness rating, with total scores summing to 1 (True = fully accurate, False = completely false). "
-    "Rationale: Brief explanation of the rating, including logical analysis, factual verification, and common sense evaluation. "
-    "Multimodal Consistency Score: Score from 0 to 1, assessing how well the image aligns with the news (0 = completely contradicts, 1 = fully supports). "
-    "Multimodal Consistency Rationale: Explanation of how the image supports or contradicts the news text, with specific supporting or conflicting details."
+    
 )
 
 # Simplified prompt when no image is provided
 PROMPT_MR2_SIMPLE = (
-    "You are a professional rumor analysis expert. Evaluate the news content’s truthfulness and respond in the following format: "
-    "Score: true: XX, false: XX \nRationale: XX "
-    "Score: News truthfulness rating, with total scores summing to 1 (True = fully accurate, False = completely false). "
-    "Rationale: Brief explanation of the rating, including logical analysis, factual verification, and common sense evaluation. "
+   
 )
 
 # Function to load data from a JSON file
@@ -55,33 +48,45 @@ def encode_image_to_base64(image_path):
         print(f"❌ Error encoding image {image_path}: {e}")
         return None
 
-# Function to validate the output format
+def contains_chinese(text):
+    """检测文本中是否包含中文字符"""
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
+
 def validate_output_format(result, image_data):
     if not result.startswith("Score:"):
         return False
 
-    required_keys = ["Rationale:"]  # Always require Rationale
+    required_keys = ["Rationale:"]
 
-    # If an image is provided, we also need to check for multimodal consistency keys
     if image_data:
         required_keys += ["Multimodal Consistency Score:", "Multimodal Consistency Rationale:"]
 
-    # Check if all required keys are present
     if not all(key in result for key in required_keys):
         return False
 
-    # Now check if the score sums to 1 for the truthfulness rating
     try:
         true_score = float(result.split("true:")[1].split(",")[0].strip())
         false_score = float(result.split("false:")[1].split("\n")[0].strip())
         if true_score + false_score != 1:
-            print(f"Error: The sum of true and false scores does not equal 1 for the result.")
+            print(f"Error: The sum of true and false scores does not equal 1.")
             return False
     except ValueError:
-        print(f"Error: Unable to extract true/false scores correctly from the result.")
+        print(f"Error: Unable to extract true/false scores.")
+        return False
+
+    # ✅ 中文检测逻辑
+    rationale_text_match = re.search(r"Rationale:\s*(.*?)(?:\nMultimodal Consistency Score:|\Z)", result, re.DOTALL)
+    if rationale_text_match:
+        rationale_text = rationale_text_match.group(1).strip()
+        if not contains_chinese(rationale_text):
+            print("❌ Rationale 中未检测到中文内容。")
+            return False
+    else:
+        print("❌ 无法提取 Rationale 内容。")
         return False
 
     return True
+
 
 # Load existing output data
 existing_data = load_json_file(output_file)
@@ -90,7 +95,7 @@ input_data = load_json_file(input_file)
 
 # Iterate over input data
 for item_id, item in input_data.items():
-    item_key = item_id if item_id.startswith("item_") else f"item_{item_id}"
+    item_key = f'item_{item_id}'
 
     if item_key in existing_data:
         print(f"{item_key} already processed. Skipping...")
