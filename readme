@@ -5,3 +5,5 @@ For our study, first you can use the code in the Code/LLM/No_rebuttal folder to 
 After obtaining the initial analysis, position detection and fact-checking of the resulting rationale was performed using the code in the Code/SLM folder.
 
 After obtaining the test results, calibration is performed using code in the Code/LLM folder, with the option of calibration method, fact+stance, fact-only, stance-only.
+
+The weights of the stance detection model can be obtained from https://drive.google.com/file/d/15RNjUb7VPCKCexrlHEzUYxqYT32Q96IU/view?usp=drive_link
