@@ -1,0 +1,164 @@
+from openai import OpenAI
+import json
+import time
+import re
+
+# 🔧 **API 设置**
+OPENAI_KEY = ""
+OPENAI_BASE = ""
+client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
+
+# 📂 **文件路径**
+news_file = "../../../Datasets/RAWFC/train.json"#新闻
+inference_file = "../../../Inference/RAWFC/No_rebuttal/train.json"#立场检测后LLM的推理
+rebuttal_file = "../../SLM/only_model/Check_No_rebuttal/Fact/rebuttal_train.json"  #事实核查模型的检测结果
+output_file = "../../../Inference/RAWFC/Rebuttal_fact/Rebuttal_train.json"  # 保存重新分析后以及未重新分析的数据
+modified_output_file = "../../../Inference/RAWFC/Rebuttal_fact/rebuttal_train_modified.json"  # 记录修改的条目
+
+
+def generate_reanalysis_prompt(news_sample, previous_llm_analysis, fact_check_status, evidence):
+    return f"""You are a professional **rumor detection expert**. Below is a news sample, along with your previous AI-generated analysis. Consideration of the current situation, analysis of new developments.
+
+---
+
+### 🔍 News Sample:
+{news_sample}
+
+
+### Your Previous LLM Analysis:
+{previous_llm_analysis}
+
+
+###  Fact-Checking Feedback:
+- Evidence from External Sources:
+{evidence}
+
+---
+
+##  Your Task:
+
+###  Evaluation Guidelines:
+1. Logical Consistency → Does the claim make sense when examined step by step?
+2. Factual Accuracy → Does the claim align with verified facts and external evidence?
+3. Common Sense Validation → Does the claim conform to widely accepted knowledge?
+
+---
+
+##  Scoring Criteria (Total = 1.0)
+- True → Completely factual, no major issues.
+- Half → Partially true, but contains misleading elements.
+- False → Completely false, contradicts verified facts.
+
+###  Expected Output Format
+Your response **must strictly follow this format** as a plain text output:
+
+Score: true: 0.X, half: 0.X, false: 0.X
+
+Rationale: Provide a clear, fact-based explanation...
+
+"""
+
+
+
+# 📂 **读取 JSON 文件**
+def load_json_file(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, FileNotFoundError):
+        print(f"⚠️ Warning: Could not load {file_path}, initializing an empty dataset.")
+        return {} if file_path.endswith(".json") else []
+
+
+# 📌 **加载数据**
+news_data = load_json_file(news_file)  # 原始新闻数据
+inference_data = load_json_file(inference_file)  # 第一次LLM分析结果
+rebuttal_data = load_json_file(rebuttal_file)  # 需要重新分析的 event_id
+modified_data = {}  # 记录被修改的 event_id
+
+# 🎯 **解析 event_id，确保匹配新闻数据**
+news_samples = {
+    str(item["event_id"]): f"Claim: {item['claim']}\nExplain: {item.get('explain', 'No_rebuttal explanation available')}"
+    for item in news_data
+}
+
+
+# 🔍 **解析 LLM 响应**
+def parse_llm_response(response):
+    """
+    解析 LLM 返回的文本，确保格式正确，并转换为字符串存储格式
+    """
+    match = re.search(
+        r"Score:\s*true:\s*([\d.]+),\s*half:\s*([\d.]+),\s*false:\s*([\d.]+)\n\nRationale:\s*(.*)",
+        response,
+        re.DOTALL,
+    )
+    if match:
+        true_score = float(match.group(1))
+        half_score = float(match.group(2))
+        false_score = float(match.group(3))
+        rationale = match.group(4).strip()
+
+        # 确保总分为 1.0
+        if abs((true_score + half_score + false_score) - 1.0) < 1e-6:
+            return f"Score: true: {true_score}, half: {half_score}, false: {false_score}\n\nRationale: {rationale}"
+
+    return None
+
+
+# 🔄 **遍历 `rebuttal_file` 找出需要重新分析的 event_id**
+for event_id_key, event_data in rebuttal_data.items():
+    event_id = str(event_id_key).replace("event_id: ", "")  # 统一 event_id 格式
+
+    # 🏷 **获取 `all_sentences_prediction` 标签**
+    all_LLMrationale = event_data.get("LLM Rationale", {})
+    all_evidence = event_data.get("Wikipedia Evidence", {})
+    all_labels = event_data.get("Wikipedia Label", "unknown")
+
+    # 🛑 **如果超过 50% 句子的标签与 `all_sentences_label` 不同，则重新分析**
+    if all_labels == "False":
+        # 🚀 **获取新闻样本**
+        news_sample = news_samples.get(event_id, "Unknown News Sample")
+
+        context_messages = [
+            {"role": "system",
+                "content": generate_reanalysis_prompt(news_sample, all_LLMrationale, all_labels, all_evidence)}
+        ]
+
+        retry_count = 0
+        max_retries = 3
+
+        while retry_count < max_retries:
+            try:
+                # 🚀 **调用 LLM 重新评估**
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=context_messages
+                )
+                result = response.choices[0].message.content.strip()
+
+                # 🚀 **解析 LLM 返回结果**
+                parsed_result = parse_llm_response(result)
+
+                if parsed_result:
+                    inference_data[event_id] = parsed_result  # **存储字符串格式**
+                    modified_data[event_id] = parsed_result  # 记录被修改的数据
+                    print(f"✅ Event {event_id} updated successfully.")
+                    break  # 结束重试
+                else:
+                    print(f"❌ Invalid response format for event_id: {event_id}. Retrying...")
+
+            except Exception as e:
+                print(f"❌ API request error for event_id: {event_id}: {e}. Retrying...")
+
+            retry_count += 1
+            time.sleep(5 + retry_count * 2)  # 指数退避
+# 💾 **保存数据**
+with open(output_file, "w", encoding="utf-8") as file:
+    json.dump(inference_data, file, ensure_ascii=False, indent=4)
+
+with open(modified_output_file, "w", encoding="utf-8") as file:
+    json.dump(modified_data, file, ensure_ascii=False, indent=4)
+
+print(f"✅ Updated data saved to {output_file}")
+print(f"✅ Modified entries saved to {modified_output_file}")
