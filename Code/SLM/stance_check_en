@@ -1,0 +1,178 @@
+import json
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel
+from torch.nn.utils.rnn import pad_sequence
+import warnings
+from transformers.utils import logging
+
+logging.set_verbosity_error()
+warnings.filterwarnings("ignore")
+
+
+# ----------------------------
+# Config
+# ----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------------------------
+# Dataset
+# ----------------------------
+class RumorStanceDataset(Dataset):
+    def __init__(self, claims_path, rationale_path, tokenizer, max_length=128, max_sentences=5):
+        self.data = []
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        claims = json.load(open(claims_path, encoding="utf-8"))
+        rationales = json.load(open(rationale_path, encoding="utf-8"))
+
+        claim_map = {str(event_id): claim_info["content"] for event_id, claim_info in claims.items()}
+
+        for rationale_key, rationale in rationales.items():
+            event_id = rationale_key.strip()
+            if event_id not in claim_map:
+                print(f"❌ No match for {event_id} in claims")
+                continue
+
+            claim = claim_map[event_id]
+
+            # ----- 普通理由处理 -----
+            rationale_sentences = list(rationale.get("Rationale_sentences", {}).values())[:max_sentences]
+            all_text = " ".join(rationale_sentences)
+            for s in rationale_sentences:
+                self.data.append((s, claim, event_id, "rationale", False))
+            if rationale_sentences:
+                self.data.append((all_text, claim, event_id, "rationale", True))
+
+            score_raw = rationale.get("Multimodal Consistency Score", "")
+            mm_sentences_dict = rationale.get("Multimodal Consistency Rationale_sentences", {})
+
+            # 只有当 score 是数字且 rationale 有内容时才处理
+            if mm_sentences_dict and isinstance(score_raw, str) and score_raw.replace('.', '', 1).isdigit():
+                try:
+                    score = float(score_raw)
+                    if score < 0.35:
+                        mm_claim = "text and image do not express the same meaning"
+                    elif score < 0.65:
+                        mm_claim = "text and image express partially consistent meaning"
+                    else:
+                        mm_claim = "text and image express the same meaning"
+
+                    mm_sentences = list(mm_sentences_dict.values())[:max_sentences]
+                    mm_all_text = " ".join(mm_sentences)
+                    for s in mm_sentences:
+                        self.data.append((s, mm_claim, event_id, "multimodal", False))
+                    if mm_sentences:
+                        self.data.append((mm_all_text, mm_claim, event_id, "multimodal", True))
+                except ValueError:
+                    pass
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+# ----------------------------
+# Collate
+# ----------------------------
+def collate_fn(batch):
+    sentences, claims, event_ids, rationale_types, is_aggregated = zip(*batch)
+    tokenizer = collate_fn.tokenizer
+    encoded = tokenizer(list(sentences), list(claims), truncation=True, padding=True, return_tensors="pt", max_length=128)
+    return encoded["input_ids"], encoded["attention_mask"], event_ids, sentences, claims, rationale_types, is_aggregated
+
+# ----------------------------
+# Model
+# ----------------------------
+class BERTStanceMatch(nn.Module):
+    def __init__(self, bert_model_path, num_labels=2):
+        super(BERTStanceMatch, self).__init__()
+        self.bert = BertModel.from_pretrained(bert_model_path)
+        hidden_size = self.bert.config.hidden_size
+
+        self.fc_comment = nn.Linear(hidden_size, hidden_size)
+        self.fc_claim = nn.Linear(hidden_size, hidden_size)
+        self.classifier = nn.Linear(hidden_size * 4, num_labels)
+
+        self.comment_weight = nn.Parameter(torch.tensor(1.5))
+        self.claim_weight = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        h_comment = self.fc_comment(outputs.last_hidden_state[:, 0, :])
+        h_claim = self.fc_claim(outputs.last_hidden_state[:, -1, :])
+
+        h_comment = h_comment * self.comment_weight
+        h_claim = h_claim * self.claim_weight
+
+        diff = h_comment - h_claim
+        product = h_comment * h_claim
+        interaction = torch.cat([h_comment, h_claim, diff, product], dim=-1)
+        logits = self.classifier(interaction)
+        return logits
+
+
+# ----------------------------
+# Evaluate
+# ----------------------------
+def evaluate(model, dataloader, dataset_type):
+    model.eval()
+    result = {}
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f"Evaluating {dataset_type}"):
+            input_ids, attention_mask, event_ids, sentences, claims, rationale_types, is_aggregated = batch
+            input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+            logits = model(input_ids, attention_mask)
+            preds = torch.argmax(logits, dim=-1).tolist()
+
+            for eid, sent, claim, rtype, agg, pred in zip(event_ids, sentences, claims, rationale_types, is_aggregated, preds):
+                eid = f"event_id: {eid}"
+                if eid not in result:
+                    result[eid] = {
+                        "rationale_sentences": [],
+                        "multimodal_rationale_sentences": [],
+                        "rationale_overall_prediction": {},
+                        "multimodal_rationale_overall_prediction": {}
+                    }
+                label = {0: "support", 1: "deny"}.get(pred, "unknown")
+                if rtype == "rationale":
+                    if agg:
+                        result[eid]["rationale_overall_prediction"] = {"sentence": sent, "predicted_label": label}
+                    else:
+                        result[eid]["rationale_sentences"].append({"sentence": sent, "predicted_label": label})
+                elif rtype == "multimodal":
+                    if agg:
+                        result[eid]["multimodal_rationale_overall_prediction"] = {"sentence": sent, "predicted_label": label}
+                    else:
+                        result[eid]["multimodal_rationale_sentences"].append({"sentence": sent, "predicted_label": label})
+
+    with open(f"rebuttal_{dataset_type}.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=4, ensure_ascii=False)
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    bert_model_path = "../../../../../../Model/bert-base-uncased"
+    checkpoint_file = "../../../../only_model/Check_No_rebuttal/Stance/checkpoint/best_model.pth"
+    tokenizer = BertTokenizer.from_pretrained(bert_model_path)
+    collate_fn.tokenizer = tokenizer
+
+    model = BERTStanceMatch(bert_model_path)
+    model.load_state_dict(torch.load(checkpoint_file, map_location=device))
+    model.to(device)
+
+    # 替换为你当前的 Weibo 数据路径
+    claims_file = "../../../../../../Datasets/Pheme/pheme_images.json"
+    rationale_file = "../../../../../../Inference/Pheme/No_rebuttal/pheme_spacy.json"
+
+    dataset = RumorStanceDataset(claims_file, rationale_file, tokenizer)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
+    evaluate(model, dataloader, "pheme")
+
+if __name__ == "__main__":
+    main()
