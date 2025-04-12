@@ -1,0 +1,178 @@
+from openai import OpenAI
+import json
+import time
+import base64
+import os
+from collections import OrderedDict
+
+# API and Client setup
+OPENAI_KEY = ""
+OPENAI_BASE = ""
+client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
+
+input_file = '../../../../Datasets/Pheme/pheme_images.json'
+output_file = '../../../../Inference/Pheme/No_rebuttal/pheme.json'
+
+image_base_path = '../../../../Datasets/Pheme/'  # 图片路径前缀
+
+# Full prompt with multimodal consistency check (used when there is an image)
+PROMPT_MR2_FULL = (
+    
+)
+
+# Simplified prompt when no image is provided
+PROMPT_MR2_SIMPLE = (
+    
+)
+
+# Function to load data from a JSON file
+def load_json_file(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return json.load(file)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {}
+
+def encode_image_to_base64(image_path):
+    """Encode image file as base64. If file does not exist or fails, return None."""
+    if not image_path or not os.path.exists(image_path):
+        print(f"⚠️ Warning: Image file {image_path} not found.")
+        return None
+    try:
+        with open(image_path, "rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
+            print(f"Image {image_path} successfully encoded.")
+            return encoded_image
+    except Exception as e:
+        print(f"❌ Error encoding image {image_path}: {e}")
+        return None
+
+# Function to validate the output format
+def validate_output_format(result, image_data):
+    if not result.startswith("Score:"):
+        return False
+
+    required_keys = ["Rationale:"]  # Always require Rationale
+
+    # If an image is provided, we also need to check for multimodal consistency keys
+    if image_data:
+        required_keys += ["Multimodal Consistency Score:", "Multimodal Consistency Rationale:"]
+
+    # Check if all required keys are present
+    if not all(key in result for key in required_keys):
+        return False
+
+    # Now check if the score sums to 1 for the truthfulness rating
+    try:
+        true_score = float(result.split("true:")[1].split(",")[0].strip())
+        false_score = float(result.split("false:")[1].split("\n")[0].strip())
+        if true_score + false_score != 1:
+            print(f"Error: The sum of true and false scores does not equal 1 for the result.")
+            return False
+    except ValueError:
+        print(f"Error: Unable to extract true/false scores correctly from the result.")
+        return False
+
+    return True
+
+# Load existing output data
+existing_data = load_json_file(output_file)
+
+input_data = load_json_file(input_file)
+
+# Iterate over input data
+for item_id, item in input_data.items():
+    item_key = item_id if item_id.startswith("item_") else f"item_{item_id}"
+
+    if item_key in existing_data:
+        print(f"{item_key} already processed. Skipping...")
+        continue
+
+    # Get news content (text content)
+    news_content = item.get("content", "")
+
+    # Get image path (assuming the image filenames are in the 'image' list)
+    image_path = item.get("image", [])[0] if item.get("image") else None  # Get the first image file name if it exists
+
+    # If the image exists, build the full image path and ensure correct slashes
+    if image_path:
+        full_image_path = os.path.join(image_base_path, 'images', image_path.replace("\\", "/"))
+    else:
+        full_image_path = None
+
+    # Encode image to base64 if the image path exists
+    image_data = encode_image_to_base64(full_image_path) if full_image_path else None
+
+    # Select the correct prompt based on the presence of the image
+    prompt = PROMPT_MR2_FULL if image_data else PROMPT_MR2_SIMPLE
+
+    # Construct message context
+    context_messages = [
+        {
+            "role": "system",
+            "content": prompt  # Use the appropriate prompt
+        },
+        {
+            "role": "user",
+            "content": f"News Content:\n{news_content}"
+        }
+    ]
+
+    # Add image message only if image_data is not empty
+    if image_data:
+        context_messages.append({
+            "role": "user",
+            "content": [
+                {
+                   "type":"image_url",
+                   "image_url":{
+                      "url":f"data:image/png;base64,{image_data}"
+                      }
+                }
+            ]
+        })
+    else:
+        print(f"Image not found for {item_key}, skipping multimodal consistency check.")
+
+    retry_count = 0
+    max_retries = 3
+
+    while retry_count < max_retries:
+        try:
+            # Call OpenAI API with text and optional image
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=context_messages
+            )
+
+            # Extract the result
+            if response.choices and len(response.choices) > 0:
+                result = response.choices[0].message.content.strip()
+            else:
+                raise ValueError("Invalid API response format.")
+
+            # Validate the output format
+            if validate_output_format(result, image_data):  # Pass image_data for checking
+                existing_data[item_key] = result
+                print(f"Processed and saved valid data for {item_key}")
+
+                # Ensure sorted order before saving
+                sorted_data = OrderedDict(sorted(existing_data.items(), key=lambda x: int(x[0].split('_')[1])))
+
+                # Save results in real-time
+                with open(output_file, "w", encoding="utf-8") as file:
+                    json.dump(sorted_data, file, ensure_ascii=False, indent=4)
+
+                break  # Exit retry loop
+            else:
+                print(f"Invalid format for {item_key}, retrying...")
+
+        except Exception as e:
+            print(f"API request error for {item_key}: {e}. Retrying...")
+
+        retry_count += 1
+        time.sleep(5)
+
+    # Skip if retries exceeded
+    if retry_count >= max_retries:
+        print(f"Failed to process {item_key} after {max_retries} retries. Skipping...")
