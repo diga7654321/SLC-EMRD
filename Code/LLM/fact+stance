@@ -1,0 +1,178 @@
+from openai import OpenAI
+import json
+import time
+import re
+
+# 🔧 **API 设置**
+OPENAI_KEY = ""
+OPENAI_BASE = ""
+client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
+
+# 📂 **文件路径**
+news_file = "../../../Datasets/RAWFC/val.json"
+inference_file = "../../../Inference/RAWFC/No_rebuttal/val.json"
+rebuttal_file = "../../SLM/only_model/Check_No_rebuttal/Fact/rebuttal_val.json"
+stance_file = "../../SLM/only_model/Check_No_rebuttal/Stance/rebuttal_val.json"
+output_file = "../../../Inference/RAWFC/Rebuttal_fact+stance/Rebuttal_val.json"
+modified_output_file = "../../../Inference/RAWFC/Rebuttal_fact+stance/rebuttal_val_modified.json"
+
+# 📌 **加载 JSON 文件**
+def load_json_file(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, FileNotFoundError):
+        print(f"⚠️ Warning: Could not load {file_path}, initializing an empty dataset.")
+        return {}
+
+# 📌 **加载数据**
+news_data = load_json_file(news_file)
+inference_data = load_json_file(inference_file)  # 原始推理数据
+rebuttal_data = load_json_file(rebuttal_file)  # 事实核查数据
+stance_data = load_json_file(stance_file)  # 立场检测数据
+output_data = load_json_file(output_file)  # 读取已有的输出文件
+modified_data = load_json_file(modified_output_file)  # 读取已有的修改文件
+
+# 🎯 **解析 event_id，确保匹配新闻数据**
+news_samples = {
+    str(item["event_id"]).replace("item_", ""): f"Claim: {item['claim']}\nExplain: {item.get('explain', 'No explanation available')}"
+    for item in news_data
+}
+
+# 📌 **检查 LLM 结果格式**
+def parse_llm_response(response):
+    match = re.search(
+        r"Score:\s*true:\s*([\d.]+),\s*half:\s*([\d.]+),\s*false:\s*([\d.]+)\n\nRationale:\s*(.*)",
+        response,
+        re.DOTALL,
+    )
+    if match:
+        true_score = float(match.group(1))
+        half_score = float(match.group(2))
+        false_score = float(match.group(3))
+        rationale = match.group(4).strip()
+        if abs((true_score + half_score + false_score) - 1.0) < 1e-6:
+            return response  # 格式正确，返回原始文本
+    return None  # 格式错误
+
+# 📌 **事实核查错误提示词**
+def generate_reanalysis_prompt(news_sample, previous_llm_analysis, evidence):
+    return f"""You are a professional **rumor detection expert**. Below is a news sample, along with your previous AI-generated analysis. Consider the current situation and analyze new developments.
+
+---
+
+### 🔍 News Sample:
+{news_sample}
+
+### Your Previous LLM Analysis:
+{previous_llm_analysis}
+
+###  Fact-Checking Feedback:
+- Evidence from External Sources:
+{evidence}
+
+---
+
+##  Expected Output Format:
+Score: true: 0.X, half: 0.X, false: 0.X
+
+Rationale: Provide a clear, fact-based explanation...
+"""
+
+# 📌 **立场检测错误提示词**
+def generate_stance_consistency_prompt(news_sample, all_sentences_text):
+    return f"""You are a professional rumor analysis expert. Below is a news sample and your previous analysis:
+
+### 🔍 News Sample:
+{news_sample}
+
+### Your Previous Analysis:
+{all_sentences_text}
+
+However, your explanation contains inconsistencies. Some individual sentence evaluations contradict the overall judgment. Please carefully reanalyze the news.
+
+---
+
+##  Expected Output Format:
+Score: true: 0.X, half: 0.X, false: 0.X
+
+Rationale: Explanation goes here...
+"""
+
+# 📌 **综合错误提示词**
+def generate_comprehensive_reanalysis_prompt(news_sample, previous_llm_analysis, evidence, all_sentences_text):
+    return f"""You are a professional **rumor detection expert**. Below is a news sample, along with your previous AI-generated analysis. This analysis has **both factual inaccuracies and logical inconsistencies in stance evaluation**. Your task is to **rewrite it** for accuracy and coherence.
+
+---
+
+### 🔍 News Sample:
+{news_sample}
+
+### Your Previous LLM Analysis:
+{previous_llm_analysis}
+
+### Fact-Checking Feedback:
+- Evidence from External Sources:
+{evidence}
+
+### Stance Inconsistency Feedback:
+Your analysis contains internal inconsistencies. Some individual sentence evaluations contradict the overall stance assessment.
+
+---
+
+##  Expected Output Format:
+Score: true: 0.X, half: 0.X, false: 0.X
+
+Rationale: Provide a clear, fact-based explanation, ensuring internal logical consistency and factual correctness.
+"""
+
+# 🔄 **遍历 rebuttal_file 处理每一条数据**
+print(f"🔍 处理 {len(rebuttal_data)} 条数据...")
+for event_id_key, event_data in rebuttal_data.items():
+    event_id = str(event_id_key).replace("event_id: ", "").replace("item_", "")
+    item_id = f"item_{event_id}"  # 生成 `item_X` 格式的 key
+
+    llm_rationale = event_data.get("LLM Rationale", "")
+    evidence = event_data.get("Wikipedia Evidence", "")
+    wikipedia_label = event_data.get("Wikipedia Label", "unknown")
+
+    stance_info = stance_data.get(f"event_id: {event_id}", {})
+    stance_sentences = stance_info.get("rationale_sentences", [])
+    stance_overall_label = stance_info.get("all_sentences_prediction", {}).get("predicted_label", "")
+
+    inconsistent_sentences = sum(1 for s in stance_sentences if s["predicted_label"] != stance_overall_label)
+    stance_inconsistency_ratio = inconsistent_sentences / max(len(stance_sentences), 1)
+
+    reanalysis_reason = []
+    if wikipedia_label == "False":
+        reanalysis_reason.append("Fact inconsistency")
+    if stance_inconsistency_ratio > 0.5:
+        reanalysis_reason.append("Stance inconsistency")
+
+    # 选择合适的提示词
+    if reanalysis_reason:
+        prompt = generate_comprehensive_reanalysis_prompt(news_samples.get(event_id, "Unknown News Sample"),
+                                                          llm_rationale, evidence,
+                                                          stance_info.get("all_sentences_prediction", {}).get("sentence", "")) \
+            if len(reanalysis_reason) > 1 else \
+            generate_reanalysis_prompt(news_samples.get(event_id, "Unknown News Sample"), llm_rationale, evidence) \
+            if "Fact inconsistency" in reanalysis_reason else \
+            generate_stance_consistency_prompt(news_samples.get(event_id, "Unknown News Sample"),
+                                               stance_info.get("all_sentences_prediction", {}).get("sentence", ""))
+
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "system", "content": prompt}])
+        parsed_result = parse_llm_response(response.choices[0].message.content.strip())
+
+        if parsed_result:
+            output_data[item_id] = parsed_result
+            modified_data[item_id] = {"updated_rationale": parsed_result, "prompt": prompt, "reanalysis_reason": reanalysis_reason}
+    else:
+        output_data[item_id] = inference_data.get(item_id, "No previous inference available")
+
+    with open(output_file, "w", encoding="utf-8") as file:
+        json.dump(output_data, file, ensure_ascii=False, indent=4)
+
+    with open(modified_output_file, "w", encoding="utf-8") as file:
+        json.dump(modified_data, file, ensure_ascii=False, indent=4)
+
+    print(f"✅ Event {event_id} 处理完成")
