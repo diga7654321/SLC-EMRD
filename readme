@@ -1,1 +1,4 @@
-This is the code for Explainable Multi-modal Rumor Detection through SLMs and Zero-Shot LLMs Collaboration in Inference
+This is the code for Explainable Multi-modal Rumor Detection through SLMs and Zero-Shot LLMs Collaboration in Inference.
+For our study, first you can use the code in the Code/LLM/No_rebuttal folder to get an initial analysis.
+After obtaining the initial analysis, position detection and fact-checking of the resulting rationale was performed using the code in the Code/SLM folder.
+After obtaining the test results, calibration is performed using code in the Code/LLM folder, with the option of calibration method, fact+stance, fact-only, stance-only.
