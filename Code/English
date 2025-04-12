@@ -1,0 +1,431 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models, transforms
+from transformers import BertModel, BertTokenizer, AdamW
+from PIL import Image
+import json
+import os
+import re
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix,accuracy_score
+from tqdm import tqdm
+from sklearn.metrics.pairwise import cosine_similarity
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 文本编码器
+bert_path = "../Model/bert-base-uncased"
+tokenizer = BertTokenizer.from_pretrained(bert_path)
+
+# 图像预处理
+image_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# ResNet-50 图像编码器（移除最后分类层）
+resnet = models.resnet50(pretrained=True)
+resnet.fc = nn.Identity()
+resnet = resnet.to(device)
+resnet.eval()
+
+
+# 计算LLM的置信度
+def compute_llm_confidence(llm_data, label_data, alpha=1.0):
+    all_llm_probs = []
+    all_labels = []
+    correct_predictions = 0  # 用于计算正确预测的数量
+    total_predictions = 0  # 用于计算总预测数
+
+    # 遍历所有LLM数据
+    for item_id, llm_raw in llm_data.items():
+
+        true_score = float(re.search(r"true:\s*([0-9\.]+)", llm_raw).group(1))
+        false_score = float(re.search(r"false:\s*([0-9\.]+)", llm_raw).group(1))
+        llm_score = {'true': true_score, 'false': false_score}
+
+        # 获取真实标签
+        label = label_data.get(item_id).get("label")
+        all_llm_probs.append(llm_score)
+        all_labels.append(label)
+
+        # 计算预测类别
+        predicted_label = 0 if true_score > false_score else 1  # 如果true_score大于false_score，预测为true(1)，否则为false(0)
+
+        # 计算正确预测的数量
+        if predicted_label == label:
+            correct_predictions += 1
+        total_predictions += 1
+
+    # 计算准确率
+    accuracy = correct_predictions / total_predictions
+    print(f"LLM Accuracy: {accuracy:.4f}")
+
+
+    # 计算负对数似然（NLL）损失
+    nll = 0.0
+    total = 0.0
+    for prob, label in zip(all_llm_probs, all_labels):
+        # 根据真实标签选择 'true' 或 'false' 概率
+        prob_value = prob['true'] if label == 0 else prob['false']
+        nll -= torch.log(torch.tensor(prob_value) + 1e-8)  # 添加小的epsilon避免log(0)
+        total += 1
+
+    # 求平均NLL损失
+    nll = nll / total
+
+    print(f"LLM Confidence: {torch.exp(-alpha * nll):.4f}")
+
+    # 根据NLL计算全局置信度：C = exp(-α × NLL)
+    return torch.exp(-alpha * nll)
+
+
+def split_dataset(data_list, test_size=0.2, val_size=0.25):
+    train_data, test_data = train_test_split(data_list, test_size=test_size, random_state=42)
+    val_size_adjusted = val_size / (1 - test_size)
+    train_data, val_data = train_test_split(train_data, test_size=val_size_adjusted, random_state=42)
+    return train_data, val_data, test_data
+
+# 加载 JSON 文件
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# 从 LLM 原始输出中提取：真假分布、多模态一致性分数、rationale、multimodal rationale
+def parse_llm_output(raw):
+    try:
+        true_score = float(raw.split("true:")[1].split(",")[0].strip())
+        false_score = float(raw.split("false:")[1].split("\n")[0].split("false:")[1].strip())
+        rationale = raw.split("Rationale:")[-1].split("Multimodal Consistency Score:")[0].strip()
+
+        if "Multimodal Consistency Score:" in raw:
+            mcs = float(raw.split("Multimodal Consistency Score:")[1].split("\n")[0].strip())
+        else:
+            mcs = None  # 表示无多模态信息
+
+        return [true_score, false_score], rationale, mcs
+    except:
+        return [0.5, 0.5], "", None
+
+# 图像向量提取
+def extract_image_vector(image_paths, image_root):
+    features = []
+    if not image_paths:  # 如果没有图片路径
+        return torch.zeros(2048).to(device)  # 返回一个零向量，长度为 2048（与 ResNet 输出一致）
+
+    for img in image_paths:
+        try:
+            img_path = os.path.join(image_root, img)
+            image = Image.open(img_path).convert("RGB")
+            image = image_transform(image).unsqueeze(0).to(device)
+            with torch.no_grad():
+                vec = resnet(image)
+            features.append(vec)
+        except Exception as e:
+            print(f"Error processing image {img}: {e}")
+            continue
+    if features:
+        return torch.mean(torch.stack(features), dim=0).squeeze(0)
+    else:
+        return torch.zeros(2048).to(device)  # 如果没有有效图片，返回一个零向量
+
+
+# 计算余弦相似度
+def compute_cosine_similarity(text_vec, image_vec):
+    # Ensure that the vectors are 2D arrays (batch_size, features)
+    text_vec = text_vec.unsqueeze(0) if text_vec.dim() == 1 else text_vec  # Convert to 2D if 1D
+    image_vec = image_vec.unsqueeze(0) if image_vec.dim() == 1 else image_vec  # Convert to 2D if 1D
+
+    # Now compute cosine similarity
+    cosine_sim = cosine_similarity(text_vec.cpu().detach().numpy(), image_vec.cpu().detach().numpy())
+    return torch.tensor(cosine_sim[0][0]).to(device)
+
+
+
+class RumorDataset(Dataset):
+    def __init__(self, data_list, llm_data, stance_data, fact_data, tokenizer, image_root, max_length=256):
+        self.data = []
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        for item in data_list:
+            item_id = str(item["event_id"])
+            content = item["content"]
+            label = int(item["label"])
+            images = item.get("image", [])
+
+            # LLM数据
+            llm_raw = llm_data.get(item_id, "")
+            llm_score, rationale_text, mcs_score = parse_llm_output(llm_raw)
+
+            # stance score
+            stance_obj = stance_data.get("event_id: " + item_id, {})
+            sent_labels = stance_obj.get("rationale_sentences", [])
+            global_label = stance_obj.get("rationale_overall_prediction", {}).get("predicted_label", "")
+            match_count = sum(1 for s in sent_labels if s.get("predicted_label") == global_label)
+            stance_score = match_count / max(len(sent_labels), 1)
+
+            # fact score
+            fact_score = fact_data.get(item_id, {}).get("Wikipedia Score (Rationale)", 0.5)
+            try:
+                fact_score = float(fact_score)
+            except:
+                fact_score = 0.5
+
+            # 编码文本
+            claim_enc = tokenizer(content, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt")
+            rationale_enc = tokenizer(rationale_text, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt")
+
+            # 图像向量
+            image_vec = extract_image_vector(images, image_root)
+
+            self.data.append({
+                "claim_ids": claim_enc["input_ids"].squeeze(0),
+                "claim_mask": claim_enc["attention_mask"].squeeze(0),
+                "rationale_ids": rationale_enc["input_ids"].squeeze(0),
+                "rationale_mask": rationale_enc["attention_mask"].squeeze(0),
+                "image_vec": image_vec,
+                "stance_score": torch.tensor([stance_score], dtype=torch.float),
+                "fact_score": torch.tensor([fact_score], dtype=torch.float),
+                "mcs_score": torch.tensor([mcs_score if mcs_score is not None else -1], dtype=torch.float),  # -1 代表缺失
+                "llm_score": torch.tensor(llm_score, dtype=torch.float),
+                "label": torch.tensor(label, dtype=torch.long)
+            })
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+class FusionModel(nn.Module):
+    def __init__(self, bert_path, d_s=32, hidden_dim=256, num_labels=2):
+        super(FusionModel, self).__init__()
+        self.bert = BertModel.from_pretrained(bert_path)
+        hidden_size = self.bert.config.hidden_size  # 一般为 768
+
+        # 三个打分转向量
+        self.proj_stance = nn.Sequential(nn.Linear(1, d_s), nn.ReLU())
+        self.proj_fact = nn.Sequential(nn.Linear(1, d_s), nn.ReLU())
+        self.proj_mcs = nn.Sequential(nn.Linear(1, d_s), nn.ReLU())
+
+        # 图像向量映射到 BERT 向量空间（将图像特征从 2048 映射到 768）
+        self.image_proj = nn.Linear(2048, hidden_size)
+
+        # 融合所有向量
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_size * 3 + 3 * d_s, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        self.classifier = nn.Linear(hidden_dim, num_labels)
+
+    def forward(self, claim_ids, claim_mask, rationale_ids, rationale_mask,
+                image_vec, stance_score, fact_score, mcs_score, llm_confidence, return_vectors=False):
+        # 获取文本向量（claim_vec）
+        claim_vec = self.bert(claim_ids, attention_mask=claim_mask).pooler_output
+
+        # 获取推理向量（rationale_vec）
+        rationale_vec = self.bert(rationale_ids, attention_mask=rationale_mask).pooler_output
+
+        # 如果没有图像信息，使用一个零向量
+        if image_vec.size(0) == 0:
+            image_embed = torch.zeros_like(claim_vec)  # 将 image_embed 设置为与文本向量相同维度的零向量
+        else:
+            # 图像嵌入（image_vec）
+            image_embed = self.image_proj(image_vec)
+
+        # 融合额外的打分信息
+        stance_embed = self.proj_stance(stance_score)
+        fact_embed = self.proj_fact(fact_score)
+
+        # 计算图像-文本的余弦相似度作为mcs_cos
+        mcs_cos = compute_cosine_similarity(claim_vec, image_embed)
+
+        # 归一化处理SLM的mcs_cos
+        mcs_cos = (mcs_cos - mcs_cos.min()) / (mcs_cos.max() - mcs_cos.min() + 1e-8)  # 防止除零错误
+
+        mcs_score = torch.where(mcs_score < 0, torch.zeros_like(mcs_score), mcs_score)
+
+        # 使用LLM的置信度加权LLM的MCS和SLM的MCS
+        final_mcs = (llm_confidence * mcs_score + (1 - llm_confidence) * mcs_cos) / 2
+
+        # 对于缺失的 MCS 信息，设为零
+        mcs_embed = self.proj_mcs(final_mcs)
+
+        # 将所有的向量连接起来
+        fusion_input = torch.cat([claim_vec, rationale_vec, image_embed, stance_embed, fact_embed, mcs_embed], dim=-1)
+        fused_rep = self.fusion(fusion_input)
+
+        # 获取最终的分类结果
+        logits = self.classifier(fused_rep)
+
+        return logits, mcs_cos
+
+
+def final_decision(llm_score, slm_logits, beta_llm, beta_slm, mcs_cos, MCS, mcs_threshold=0.3):
+
+
+    slm_probs = F.softmax(slm_logits, dim=-1)
+    llm_pred = torch.argmax(llm_score, dim=-1)
+    slm_pred = torch.argmax(slm_probs, dim=-1)
+
+    final_preds = []
+
+    for i in range(len(llm_pred)):
+        # 如果LLM和SLM的预测一致，直接输出
+        if llm_pred[i] == slm_pred[i]:
+            final_preds.append(llm_pred[i])
+        else:
+            # 如果没有图片信息（mcs_cos不存在或者非常小）
+            if MCS[i] == -1:
+                # 当没有图片信息时，直接选择置信度更高的模型
+                conf_llm = llm_score[i][llm_pred[i]] * beta_llm
+                conf_slm = slm_probs[i][slm_pred[i]] * beta_slm
+                final_preds.append(slm_pred[i] if conf_slm >= conf_llm else llm_pred[i])
+            else:
+                # 使用MCS来决定（有图片信息时）
+                if mcs_cos[i] < mcs_threshold and MCS[i] < mcs_threshold:
+                    final_preds.append(torch.tensor(1))  # 输出为 False
+                else:
+                    conf_llm = llm_score[i][llm_pred[i]] * beta_llm
+                    conf_slm = slm_probs[i][slm_pred[i]] * beta_slm
+                    final_preds.append(slm_pred[i] if conf_slm >= conf_llm else llm_pred[i])
+
+    return torch.stack(final_preds)
+
+
+def compute_confidence(model_probs, true_labels, alpha=1.0):
+    """
+    根据 NLL 损失计算模型全局置信度
+    C = exp(-α × NLL)，返回标量
+    """
+    nll = 0.0
+    total = 0
+    for prob, label in zip(model_probs, true_labels):
+        nll -= torch.log(prob[label] + 1e-8)
+        total += 1
+
+
+    nll = nll / total
+    print(f"SLM Confidence: {torch.exp(-alpha * nll):.4f}")
+    return torch.exp(-alpha * nll)
+
+
+def evaluate_with_fusion(model, loader, beta_llm, beta_slm, mcs_thresh=0.3, name="Eval"):
+    model.eval()
+    all_preds, all_labels = [], []
+    slm_probs, gold_labels, mcs_scores = [], [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            inputs = {k: v.to(device) for k, v in batch.items() if k not in ["label", "llm_score"]}
+            labels = batch["label"].to(device)
+            llm_score = batch["llm_score"].to(device)
+            MCS = batch["mcs_score"].squeeze(-1).to(device)
+
+            logits, mcs_cos = model(**inputs, llm_confidence=beta_llm)
+            probs = F.softmax(logits, dim=-1)
+
+            pred = final_decision(llm_score, logits, beta_llm, beta_slm, mcs_cos, MCS, mcs_thresh)
+
+            all_preds.extend(pred.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+
+            slm_probs.extend(probs.cpu())
+            gold_labels.extend(labels.cpu())
+            mcs_scores.extend(MCS.cpu())
+
+    print(f"\n📊 {name} Evaluation:")
+    # 输出混淆矩阵
+    print("Confusion Matrix:")
+    print(confusion_matrix(all_labels, all_preds))
+
+    # 计算并输出总体准确率
+    accuracy = accuracy_score(all_labels, all_preds)
+    print(f"Overall Accuracy: {accuracy:.4f}")
+    return slm_probs, gold_labels
+
+
+def main():
+    image_root = "../Datasets/Pheme/images/"
+    tokenizer = BertTokenizer.from_pretrained("../Model/bert-base-uncased")
+    raw_data_raw = load_json("../Datasets/Pheme/pheme_images.json")
+    raw_data = [{"event_id": k, **v} for k, v in raw_data_raw.items()]
+
+    llm_data = load_json("../Inference/Pheme/No_rebuttal/pheme.json")
+    stance_data = load_json("SLM/mutil_model/Pheme/Check_No_rebuttal/Stance/rebuttal_pheme.json")
+    fact_data = load_json("SLM/mutil_model/Pheme/Check_No_rebuttal/Fact/rebuttal_pheme.json")
+
+
+    beta_llm = compute_llm_confidence(llm_data, raw_data_raw, alpha=1.0)
+
+    train_list, val_list, test_list = split_dataset(raw_data)
+
+    train_dataset = RumorDataset(train_list, llm_data, stance_data, fact_data, tokenizer, image_root)
+    val_dataset = RumorDataset(val_list, llm_data, stance_data, fact_data, tokenizer, image_root)
+    test_dataset = RumorDataset(test_list, llm_data, stance_data, fact_data, tokenizer, image_root)
+
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8)
+    test_loader = DataLoader(test_dataset, batch_size=8)
+
+    model = FusionModel("../Model/bert-base-uncased").to(device)
+    optimizer = AdamW(model.parameters(), lr=2e-5)
+
+    # 训练（每4个epoch后进行一次验证）
+    num_epochs = 20  # 假设你想训练20个epoch
+    eval_frequency = 1  # 每4个epoch评估一次验证集
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        total_loss = 0
+        slm_probs = []  # 用于存储SLM的输出probabilities
+        gold_labels = []  # 用于存储真实标签
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
+            inputs = {k: v.to(device) for k, v in batch.items() if k not in ["label", "llm_score"]}
+            labels = batch["label"].to(device)
+
+            logits , mcs = model(**inputs, llm_confidence=beta_llm)
+            loss = nn.CrossEntropyLoss()(logits, labels)
+
+            # 获取SLM的输出概率
+            probs = F.softmax(logits, dim=-1)
+            slm_probs.extend(probs.cpu())  # 用于计算SLM置信度
+            gold_labels.extend(labels.cpu())  # 用于计算SLM置信度
+
+            # 反向传播
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        # 每轮训练结束后计算SLM置信度
+        beta_slm_train = compute_confidence(slm_probs, gold_labels)
+        print(f"✅ Epoch {epoch} Training Loss: {total_loss:.4f}")
+        print(f"✅ LLM Global Confidence (β1): {beta_llm:.4f}")
+        print(f"✅ Epoch {epoch} SLM Global Confidence (β2): {beta_slm_train:.4f}")
+
+        # 每4个epoch评估一次验证集
+        if epoch % eval_frequency == 0:
+            print(f"✅ Evaluating on Validation set after Epoch {epoch}")
+            slm_probs_val, gold_val = evaluate_with_fusion(model, val_loader, beta_llm, beta_slm_train, name="Validation")
+            beta_llm = beta_llm  # LLM置信度全局常量
+            beta_slm_val = compute_confidence(slm_probs_val, gold_val)  # 计算验证集上的SLM置信度
+            print(f"✅ LLM Global Confidence (β1): {beta_llm:.4f}")
+            print(f"✅ SLM Global Confidence (β2): {beta_slm_val:.4f}")
+
+            # 测试集融合评估
+            evaluate_with_fusion(model, test_loader, beta_llm, beta_slm_val, name="Test")
+
+if __name__ == "__main__":
+    main()
+
